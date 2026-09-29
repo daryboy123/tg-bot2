@@ -22,7 +22,7 @@ export default async function handler(req, res) {
 
       console.log(`Received message: "${userText}" from chat ${chatId}`);
 
-      // 调用 AI 接口
+      // 1. 调用 AI 接口
       const aiResponse = await fetch(`${apiBase}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -39,12 +39,11 @@ export default async function handler(req, res) {
       });
 
       const aiData = await aiResponse.json();
-      console.log('AI Response status:', aiResponse.status);
-
       const replyText = aiData.choices?.[0]?.message?.content || '抱歉，AI 暂时没有返回内容。';
+      console.log('AI generated reply successfully, sending to Telegram...');
 
-      // 发送回 Telegram
-      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      // 2. 将回复发送回 Telegram，并捕获返回值
+      const tgRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -52,11 +51,17 @@ export default async function handler(req, res) {
           text: replyText
         })
       });
+
+      const tgData = await tgRes.json();
+      if (!tgData.ok) {
+        console.error('Telegram API Error:', tgData);
+      } else {
+        console.log('Successfully sent message back to Telegram!');
+      }
     }
 
     return res.status(200).json({ ok: true });
   } catch (error) {
-    // 打印出最详细的错误堆栈
     console.error('Detailed Error Stack:', error);
     return res.status(500).json({ error: error.message, stack: error.stack });
   }
