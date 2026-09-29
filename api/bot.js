@@ -16,13 +16,58 @@ export default async function handler(req, res) {
   try {
     const update = req.body;
     
-    if (update && update.message && update.message.text) {
+    if (update && update.message) {
       const chatId = update.message.chat.id;
-      const userText = update.message.text;
+      // 获取文本或图片附带的说明文字 (Caption)
+      const userText = update.message.text || update.message.caption || '';
+      let imageUrl = null;
 
-      console.log(`Received message: "${userText}" from chat ${chatId}`);
+      // 1. 如果用户发送了图片，自动获取最高清的图片并转换为 Base64
+      if (update.message.photo && update.message.photo.length > 0) {
+        const photo = update.message.photo[update.message.photo.length - 1];
+        const fileId = photo.file_id;
 
-      // 1. 调用 AI 接口
+        // 向 Telegram 请求文件的下载路径
+        const fileRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`);
+        const fileData = await fileRes.json();
+        
+        if (fileData.ok) {
+          const filePath = fileData.result.file_path;
+          const downloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+          
+          // 下载图片并转为 Data URL 格式
+          const imgRes = await fetch(downloadUrl);
+          const arrayBuffer = await imgRes.arrayBuffer();
+          const base64Image = Buffer.from(arrayBuffer).toString('base64');
+          imageUrl = `data:image/jpeg;base64,${base64Image}`;
+        }
+      }
+
+      // 如果既没有文字也没有图片，直接返回
+      if (!userText && !imageUrl) {
+        return res.status(200).json({ ok: true });
+      }
+
+      console.log(`Processing message from ${chatId}, has image: ${!!imageUrl}`);
+
+      // 2. 构造多模态或纯文本的 AI 请求体
+      let messages = [];
+      if (imageUrl) {
+        messages.push({
+          role: 'user',
+          content: [
+            { type: 'text', text: userText || '请帮我看看这张图片。' },
+            { type: 'image_url', image_url: { url: imageUrl } }
+          ]
+        });
+      } else {
+        messages.push({
+          role: 'user',
+          content: userText
+        });
+      }
+
+      // 3. 调用 AI 接口
       const aiResponse = await fetch(`${apiBase}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -31,19 +76,15 @@ export default async function handler(req, res) {
         },
         body: JSON.stringify({
           model: modelName,
-          messages: [
-            { role: 'system', content: 'You are a helpful assistant.' },
-            { role: 'user', content: userText }
-          ]
+          messages: messages
         })
       });
 
       const aiData = await aiResponse.json();
       const replyText = aiData.choices?.[0]?.message?.content || '抱歉，AI 暂时没有返回内容。';
-      console.log('AI generated reply successfully, sending to Telegram...');
 
-      // 2. 将回复发送回 Telegram，并捕获返回值
-      const tgRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      // 4. 将 AI 的回复发送回 Telegram
+      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -51,13 +92,6 @@ export default async function handler(req, res) {
           text: replyText
         })
       });
-
-      const tgData = await tgRes.json();
-      if (!tgData.ok) {
-        console.error('Telegram API Error:', tgData);
-      } else {
-        console.log('Successfully sent message back to Telegram!');
-      }
     }
 
     return res.status(200).json({ ok: true });
