@@ -1,15 +1,13 @@
 export default async function handler(req, res) {
-  // 只允许 POST 请求
   if (req.method !== 'POST') {
     return res.status(200).json({ status: 'Bot is running' });
   }
 
   const { BOT_TOKEN, API_KEY, API_BASE, MODEL_NAME } = process.env;
 
-  // 基础环境变量校验
   if (!BOT_TOKEN || !API_KEY) {
-    console.error('Missing BOT_TOKEN or API_KEY in environment variables.');
-    return res.status(500).json({ error: 'Server configuration error: Missing credentials.' });
+    console.error('Missing BOT_TOKEN or API_KEY');
+    return res.status(500).json({ error: 'Missing credentials.' });
   }
 
   const apiBase = API_BASE || 'https://apinebula.ai/v1';
@@ -18,12 +16,13 @@ export default async function handler(req, res) {
   try {
     const update = req.body;
     
-    // 检查是否有用户发来的文本消息
     if (update && update.message && update.message.text) {
       const chatId = update.message.chat.id;
       const userText = update.message.text;
 
-      // 调用 Grok AI 接口
+      console.log(`Received message: "${userText}" from chat ${chatId}`);
+
+      // 调用 AI 接口
       const aiResponse = await fetch(`${apiBase}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -40,9 +39,11 @@ export default async function handler(req, res) {
       });
 
       const aiData = await aiResponse.json();
+      console.log('AI Response status:', aiResponse.status);
+
       const replyText = aiData.choices?.[0]?.message?.content || '抱歉，AI 暂时没有返回内容。';
 
-      // 将回复发送回 Telegram
+      // 发送回 Telegram
       await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -55,7 +56,8 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ ok: true });
   } catch (error) {
-    console.error('Error handling telegram update:', error);
-    return res.status(500).json({ error: error.message });
+    // 打印出最详细的错误堆栈
+    console.error('Detailed Error Stack:', error);
+    return res.status(500).json({ error: error.message, stack: error.stack });
   }
 }
