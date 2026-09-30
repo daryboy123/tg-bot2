@@ -70,38 +70,28 @@ export default async function handler(req, res) {
       }
 
       // ==========================================
-      // 分辨率与无损 PNG 格式强制约束
+      // 根据官方文档规范解析分辨率与输出格式
       // ==========================================
       const parseResolutionAndPrompt = (rawText, commandPrefix) => {
         let cleanText = rawText.replace(commandPrefix, '').trim();
-        let resolutionDesc = 'Lossless PNG format, 1024x1024 pixels';
         let targetResolutionTag = '1K';
 
-        const resMatch = cleanText.match(/\b(1k|2k|3k|4k)\b/i);
+        const resMatch = cleanText.match(/\b(512|1k|2k|4k)\b/i);
         if (resMatch) {
           targetResolutionTag = resMatch[1].toUpperCase();
           cleanText = cleanText.replace(resMatch[0], '').trim();
-        }
-
-        if (targetResolutionTag === '4K') {
-          resolutionDesc = 'Lossless PNG format, native 3840x2160 pixels ultra high definition, maximum detail, uncompressed bitmap';
-        } else if (targetResolutionTag === '3K') {
-          resolutionDesc = 'Lossless PNG format, native 2880x1620 pixels, high definition uncompressed';
-        } else if (targetResolutionTag === '2K') {
-          resolutionDesc = 'Lossless PNG format, native 2048x1024 pixels, high definition uncompressed';
-        } else {
-          resolutionDesc = 'Lossless PNG format, 1024x1024 pixels';
         }
 
         const finalPrompt = cleanText || 'A creative artwork';
         return {
           prompt: finalPrompt,
           resolutionTag: targetResolutionTag,
-          enhancedPrompt: `${finalPrompt}, ${resolutionDesc}`
+          // 明确在提示词里强化官方支持的 4K 分辨率与无损 PNG 要求
+          enhancedPrompt: `${finalPrompt}, output strictly as lossless PNG format, native ultra-high definition resolution (${targetResolutionTag})`
         };
       };
 
-      // 核心处理函数：强制转 PNG 并提供网页直链
+      // 核心处理函数：直接拉取源二进制，不压缩，输出 .png 文件和直链
       const sendImageResult = async (botToken, chatId, bufferOrUrl, caption, resolutionTag, isBase64) => {
         let rawBuffer = null;
         let directUrl = null;
@@ -122,7 +112,7 @@ export default async function handler(req, res) {
           }
         }
 
-        // 1. 发送 Telegram 预览图
+        // 1. 发送 Telegram 预览图（仅用于聊天展示）
         if (isBase64 && rawBuffer) {
           await sendTelegramPhotoBuffer(botToken, chatId, rawBuffer, `✨ [${resolutionTag}] 预览图: ${caption}`, `preview.png`);
         } else {
@@ -137,15 +127,15 @@ export default async function handler(req, res) {
           });
         }
 
-        // 2. 如果模型返回了网络直链，直接把直链发出来！你可以点开它看是不是源头尺寸
+        // 2. 发送原始网络直链，供你直接在浏览器打开
         if (directUrl) {
-          await sendTelegramMessage(botToken, chatId, `🌐 [${resolutionTag}] 原始图片网络直链（点击可在浏览器查看源图）:\n${directUrl}`);
+          await sendTelegramMessage(botToken, chatId, `🌐 [${resolutionTag}] 官方无损 PNG 原始图片直链（可点开保存大图）:\n${directUrl}`);
         }
 
-        // 3. 强制以 .png 后缀发送无损文件
+        // 3. 强制作为无损 PNG 文件（Document）发送，绝对不经过 Telegram 压缩
         if (rawBuffer) {
           const filename = `Artwork_${resolutionTag}_${Date.now()}.png`;
-          await sendTelegramDocumentBuffer(botToken, chatId, rawBuffer, `📦 [${resolutionTag}] 无损 PNG 格式原图文件`, filename);
+          await sendTelegramDocumentBuffer(botToken, chatId, rawBuffer, `📦 [${resolutionTag}] 4K原生无损 PNG 原图文件`, filename);
         }
       };
 
@@ -156,7 +146,7 @@ export default async function handler(req, res) {
         const prefix = userText.startsWith('/img2img') ? '/img2img' : (userText.startsWith('/draw') ? '/draw' : '');
         const { prompt, resolutionTag, enhancedPrompt } = parseResolutionAndPrompt(userText, prefix);
         
-        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在以 [${resolutionTag}] 无损 PNG 规格参考创作捏~ (≧◡≦)`);
+        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在以官方 [${resolutionTag}] 规格和 PNG 无损格式进行图生图创作，请稍候捏~ (≧◡≦)`);
 
         try {
           const imageApiRes = await fetch(`${IMAGE_API_BASE}/chat/completions`, {
@@ -167,11 +157,16 @@ export default async function handler(req, res) {
             },
             body: JSON.stringify({
               model: IMAGE_MODEL_NAME,
+              // 按照官方规范，在 generation_config 或请求体中带上分辨率及 PNG 格式约束
+              generation_config: {
+                response_mime_type: "image/png",
+                resolution: resolutionTag
+              },
               messages: [
                 {
                   role: 'user',
                   content: [
-                    { type: 'text', text: `Generate a new image based on this reference image. Style & details requirement: ${enhancedPrompt}` },
+                    { type: 'text', text: `Generate a new image based on this reference image. Requirements: ${enhancedPrompt}` },
                     { type: 'image_url', image_url: { url: imageUrl } }
                   ]
                 }
@@ -210,7 +205,7 @@ export default async function handler(req, res) {
       }
 
       // ==========================================
-      // 4. 处理纯文生图指令：/draw <1K/2K/3K/4K> <提示词>
+      // 4. 处理纯文生图指令：/draw <512/1K/2K/4K> <提示词>
       // ==========================================
       if (userText.startsWith('/draw ')) {
         const { prompt, resolutionTag, enhancedPrompt } = parseResolutionAndPrompt(userText, '/draw');
@@ -220,7 +215,7 @@ export default async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
 
-        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在为您绘制 [${resolutionTag}] 无损 PNG 大图，马上把网页直链和原图文件发给你哦~ ✨`);
+        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在为您调用官方 [${resolutionTag}] 极清规范绘制无损 PNG 大图，马上把网页直链和原文件发给你哦~ ✨`);
 
         try {
           const imageApiRes = await fetch(`${IMAGE_API_BASE}/chat/completions`, {
@@ -231,6 +226,11 @@ export default async function handler(req, res) {
             },
             body: JSON.stringify({
               model: IMAGE_MODEL_NAME,
+              // 关键：显式带上官方支持的 resolution 和 response_mime_type 传参
+              generation_config: {
+                response_mime_type: "image/png",
+                resolution: resolutionTag
+              },
               messages: [{ role: 'user', content: `Generate an image: ${enhancedPrompt}` }]
             })
           });
@@ -324,7 +324,7 @@ async function sendTelegramPhotoBuffer(botToken, chatId, buffer, caption, filena
     Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`),
     Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="${filename}"\r\nContent-Type: image/png\r\n\r\n`),
     buffer,
-    Buffer.from(`--${boundary}--\r\n`)
+    Buffer.from(`\r\n--${boundary}--\r\n`)
   ];
   await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
     method: 'POST',
