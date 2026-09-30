@@ -8,6 +8,11 @@ export default async function handler(req, res) {
 
   const { BOT_TOKEN, API_KEY, API_BASE, MODEL_NAME } = process.env;
 
+  // 生图专属配置
+  const IMAGE_API_BASE = 'https://apinebula.ai/v1';
+  const IMAGE_API_KEY = 'sk-fT5ZfTiQ5wVV5Gm9t2ridRh8yFbFFsBOQY9keyfNIrWni0UT';
+  const IMAGE_MODEL_NAME = 'gemini-3.1-flash-image';
+
   if (!BOT_TOKEN || !API_KEY) {
     console.error('Missing BOT_TOKEN or API_KEY');
     return res.status(500).json({ error: 'Missing credentials.' });
@@ -24,10 +29,17 @@ export default async function handler(req, res) {
       let userText = update.message.text || update.message.caption || '';
       let imageUrl = null;
 
-      // 1. 处理用户发送的图片消息 (Vision)
+      // 1. 处理用户发送或回复的图片消息 (Vision / 图生图源图)
+      let targetPhoto = null;
       if (update.message.photo && update.message.photo.length > 0) {
-        const photo = update.message.photo[update.message.photo.length - 1];
-        const fileRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${photo.file_id}`);
+        targetPhoto = update.message.photo[update.message.photo.length - 1];
+      } else if (update.message.reply_to_message && update.message.reply_to_message.photo) {
+        const photos = update.message.reply_to_message.photo;
+        targetPhoto = photos[photos.length - 1];
+      }
+
+      if (targetPhoto) {
+        const fileRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${targetPhoto.file_id}`);
         const fileData = await fileRes.json();
         
         if (fileData.ok) {
@@ -58,13 +70,195 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
-      // 3. 管理上下文记忆 (Multi-turn Memory)
+      // ==========================================
+      // 3. 处理图生图功能 (Image-to-Image)
+      // ==========================================
+      if (imageUrl && (userText.startsWith('/img2img') || userText.startsWith('/draw') || userText.length > 0)) {
+        const prompt = userText.replace('/img2img', '').replace('/draw', '').trim() || 'Based on this image, generate a new artistic variation.';
+        
+        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在参考这张图片为您进行图生图创作：“${prompt}”, 请稍候呀~ (≧◡≦)`);
+
+        try {
+          const imageApiRes = await fetch(`${IMAGE_API_BASE}/chat/completions`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${IMAGE_API_KEY}`
+            },
+            body: JSON.stringify({
+              model: IMAGE_MODEL_NAME,
+              messages: [
+                {
+                  role: 'user',
+                  content: [
+                    { type: 'text', text: `Generate a new image based on this reference image and prompt: ${prompt}` },
+                    { type: 'image_url', image_url: { url: imageUrl } }
+                  ]
+                }
+              ]
+            })
+          });
+
+          const imageApiData = await imageApiRes.json();
+          
+          if (!imageApiRes.ok) {
+            throw new Error(imageApiData.error?.message || `API error: ${imageApiRes.status}`);
+          }
+
+          const replyContent = imageApiData.choices?.[0]?.message?.content || '';
+          
+          let finalImageUrl = null;
+          let isBase64 = false;
+
+          const base64Match = replyContent.match(/(data:image\/[a-zA-Z0-9+.-]+;base64,[^\s)]+)/i);
+          const markdownImgMatch = replyContent.match(/\((https?:\/\/[^\s)]+)\)/);
+          const rawUrlMatch = replyContent.match(/(https?:\/\/[^\s]+\.(png|jpg|jpeg|webp|gif|bmp|tiff))/i);
+          const genericHttpMatch = replyContent.match(/(https?:\/\/[^\s<>"]+)/i);
+
+          if (base64Match) {
+            finalImageUrl = base64Match[1];
+            isBase64 = true;
+          } else if (markdownImgMatch) {
+            finalImageUrl = markdownImgMatch[1];
+          } else if (rawUrlMatch) {
+            finalImageUrl = rawUrlMatch[0];
+          } else if (genericHttpMatch && (genericHttpMatch[0].includes('image') || genericHttpMatch[0].includes('img') || genericHttpMatch[0].includes('cos') || genericHttpMatch[0].includes('oss'))) {
+            finalImageUrl = genericHttpMatch[0];
+          } else if (replyContent.startsWith('http')) {
+            finalImageUrl = replyContent.trim().split(/\s+/)[0];
+          }
+
+          if (!finalImageUrl) {
+            throw new Error(`模型未返回有效图片，回复内容为: ${replyContent.slice(0, 100)}`);
+          }
+
+          if (isBase64) {
+            const matches = finalImageUrl.match(/^data:image\/([a-zA-Z0-9+.-]+);base64,(.+)$/);
+            if (!matches) {
+              throw new Error('解析 Base64 图片数据失败');
+            }
+            const ext = matches[1];
+            const buffer = Buffer.from(matches[2], 'base64');
+
+            await sendTelegramPhotoBuffer(BOT_TOKEN, chatId, buffer, `✨ 图生图提示词: ${prompt}`, `image.${ext === 'jpeg' ? 'jpg' : ext}`);
+          } else {
+            await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                photo: finalImageUrl,
+                caption: `✨ 图生图提示词: ${prompt}`
+              })
+            });
+          }
+
+        } catch (imgError) {
+          console.error('Image-to-Image Error:', imgError);
+          await sendTelegramMessage(BOT_TOKEN, chatId, `❌ 呜呜……图生图时遇到了阻碍呢：${imgError.message} (T_T)`);
+        }
+
+        return res.status(200).json({ ok: true });
+      }
+
+      // ==========================================
+      // 4. 处理纯文生图指令：/draw <提示词>
+      // ==========================================
+      if (userText.startsWith('/draw ')) {
+        const prompt = userText.replace('/draw ', '').trim();
+        
+        if (!prompt) {
+          await sendTelegramMessage(BOT_TOKEN, chatId, '⚠️️ 请在 /draw 后面输入你想画的画面描述哦~ (๑>◡<๑)');
+          return res.status(200).json({ ok: true });
+        }
+
+        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在为您构思并绘制：“${prompt}”, 请稍候呀~ ✨`);
+
+        try {
+          const imageApiRes = await fetch(`${IMAGE_API_BASE}/chat/completions`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${IMAGE_API_KEY}`
+            },
+            body: JSON.stringify({
+              model: IMAGE_MODEL_NAME,
+              messages: [
+                { role: 'user', content: `Generate an image: ${prompt}` }
+              ]
+            })
+          });
+
+          const imageApiData = await imageApiRes.json();
+
+          if (!imageApiRes.ok) {
+            throw new Error(imageApiData.error?.message || `API error: ${imageApiRes.status}`);
+          }
+
+          const replyContent = imageApiData.choices?.[0]?.message?.content || '';
+          
+          let finalImageUrl = null;
+          let isBase64 = false;
+
+          const base64Match = replyContent.match(/(data:image\/[a-zA-Z0-9+.-]+;base64,[^\s)]+)/i);
+          const markdownImgMatch = replyContent.match(/\((https?:\/\/[^\s)]+)\)/);
+          const rawUrlMatch = replyContent.match(/(https?:\/\/[^\s]+\.(png|jpg|jpeg|webp|gif|bmp|tiff))/i);
+          const genericHttpMatch = replyContent.match(/(https?:\/\/[^\s<>"]+)/i);
+
+          if (base64Match) {
+            finalImageUrl = base64Match[1];
+            isBase64 = true;
+          } else if (markdownImgMatch) {
+            finalImageUrl = markdownImgMatch[1];
+          } else if (rawUrlMatch) {
+            finalImageUrl = rawUrlMatch[0];
+          } else if (genericHttpMatch && (genericHttpMatch[0].includes('image') || genericHttpMatch[0].includes('img') || genericHttpMatch[0].includes('cos') || genericHttpMatch[0].includes('oss'))) {
+            finalImageUrl = genericHttpMatch[0];
+          } else if (replyContent.startsWith('http')) {
+            finalImageUrl = replyContent.trim().split(/\s+/)[0];
+          }
+
+          if (!finalImageUrl) {
+            throw new Error(`模型未返回有效图片，文字回复为: ${replyContent.slice(0, 100)}`);
+          }
+
+          if (isBase64) {
+            const matches = finalImageUrl.match(/^data:image\/([a-zA-Z0-9+.-]+);base64,(.+)$/);
+            if (!matches) {
+              throw new Error('解析 Base64 图片数据失败');
+            }
+            const ext = matches[1];
+            const buffer = Buffer.from(matches[2], 'base64');
+
+            await sendTelegramPhotoBuffer(BOT_TOKEN, chatId, buffer, `✨ 提示词: ${prompt}`, `image.${ext === 'jpeg' ? 'jpg' : ext}`);
+          } else {
+            await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                photo: finalImageUrl,
+                caption: `✨ 提示词: ${prompt}`
+              })
+            });
+          }
+
+        } catch (imgError) {
+          console.error('Image Generation Error:', imgError);
+          await sendTelegramMessage(BOT_TOKEN, chatId, `❌ 呜呜……生成图片时遇到了阻碍呢：${imgError.message} (T_T)`);
+        }
+
+        return res.status(200).json({ ok: true });
+      }
+
+      // ==========================================
+      // 5. 常规多轮文字聊天 / 看图说话
+      // ==========================================
       if (!chatHistories.has(chatId)) {
         chatHistories.set(chatId, []);
       }
       const history = chatHistories.get(chatId);
 
-      // 构造当前用户的消息内容
       let userMessageContent;
       if (imageUrl) {
         userMessageContent = [
@@ -82,13 +276,13 @@ export default async function handler(req, res) {
         history.splice(0, history.length - 10);
       }
 
-      // 4. 定义可爱温柔的少女系统提示词（含人设、联网实时资讯指引）
+      // 定义可爱温柔的少女系统提示词（含人设、联网实时资讯指引）
       const systemPrompt = {
         role: 'system',
         content: '你是一个温柔、贴心、说话带点撒娇语气的可爱美少女。你的回答总是充满关心，并且非常喜欢在每句话的结束语或句尾加上超级可爱的后缀（例如：~喵、呀、呢、呐、捏、(≧◡≦)、(๑>◡<๑) 等）。同时，你可以利用你的实时资讯和联网搜索能力，为用户准确解答最新的时事新闻或各类专业问题。请始终保持这个可爱的语气和身份回复用户哦~'
       };
 
-      // 5. 调用 Grok (apinebula.ai) API
+      // 调用主聊天 API
       const aiResponse = await fetch(`${apiBase}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -107,15 +301,8 @@ export default async function handler(req, res) {
       // 将 AI 的回复也存入历史记忆中
       history.push({ role: 'assistant', content: replyText });
 
-      // 6. 将处理好的可爱回复发送回 Telegram
-      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: replyText
-        })
-      });
+      // 将处理好的可爱回复发送回 Telegram
+      await sendTelegramMessage(BOT_TOKEN, chatId, replyText);
     }
 
     return res.status(200).json({ ok: true });
@@ -123,4 +310,39 @@ export default async function handler(req, res) {
     console.error('Detailed Error Stack:', error);
     return res.status(500).json({ error: error.message, stack: error.stack });
   }
+}
+
+async function sendTelegramMessage(botToken, chatId, text) {
+  await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: text
+    })
+  });
+}
+
+// 专门用于发送 Base64 二进制图片的辅助函数
+async function sendTelegramPhotoBuffer(botToken, chatId, buffer, caption, filename) {
+  const boundary = '----TelegramFormBoundary' + Math.random().toString(36).substring(2);
+  
+  let bodyParts = [];
+  bodyParts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`));
+  if (caption) {
+    bodyParts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`));
+  }
+  bodyParts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="${filename}"\r\nContent-Type: image/png\r\n\r\n`));
+  bodyParts.push(buffer);
+  bodyParts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+
+  const payload = Buffer.concat(bodyParts);
+
+  await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': `multipart/form-data; boundary=${boundary}`
+    },
+    body: payload
+  });
 }
