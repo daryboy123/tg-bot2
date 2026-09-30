@@ -70,7 +70,7 @@ export default async function handler(req, res) {
       }
 
       // ==========================================
-      // 根据官方文档规范解析分辨率与输出格式
+      // 分辨率解析
       // ==========================================
       const parseResolutionAndPrompt = (rawText, commandPrefix) => {
         let cleanText = rawText.replace(commandPrefix, '').trim();
@@ -86,12 +86,11 @@ export default async function handler(req, res) {
         return {
           prompt: finalPrompt,
           resolutionTag: targetResolutionTag,
-          // 明确在提示词里强化官方支持的 4K 分辨率与无损 PNG 要求
           enhancedPrompt: `${finalPrompt}, output strictly as lossless PNG format, native ultra-high definition resolution (${targetResolutionTag})`
         };
       };
 
-      // 核心处理函数：直接拉取源二进制，不压缩，输出 .png 文件和直链
+      // 核心处理函数
       const sendImageResult = async (botToken, chatId, bufferOrUrl, caption, resolutionTag, isBase64) => {
         let rawBuffer = null;
         let directUrl = null;
@@ -112,7 +111,7 @@ export default async function handler(req, res) {
           }
         }
 
-        // 1. 发送 Telegram 预览图（仅用于聊天展示）
+        // 1. 发送预览图
         if (isBase64 && rawBuffer) {
           await sendTelegramPhotoBuffer(botToken, chatId, rawBuffer, `✨ [${resolutionTag}] 预览图: ${caption}`, `preview.png`);
         } else {
@@ -127,15 +126,15 @@ export default async function handler(req, res) {
           });
         }
 
-        // 2. 发送原始网络直链，供你直接在浏览器打开
+        // 2. 发送直链（如果有）
         if (directUrl) {
-          await sendTelegramMessage(botToken, chatId, `🌐 [${resolutionTag}] 官方无损 PNG 原始图片直链（可点开保存大图）:\n${directUrl}`);
+          await sendTelegramMessage(botToken, chatId, `🌐 [${resolutionTag}] 原始图片网络直链:\n${directUrl}`);
         }
 
-        // 3. 强制作为无损 PNG 文件（Document）发送，绝对不经过 Telegram 压缩
+        // 3. 强制作为无损 PNG 文件（Document）发送，这是最核心的无压缩原图
         if (rawBuffer) {
           const filename = `Artwork_${resolutionTag}_${Date.now()}.png`;
-          await sendTelegramDocumentBuffer(botToken, chatId, rawBuffer, `📦 [${resolutionTag}] 4K原生无损 PNG 原图文件`, filename);
+          await sendTelegramDocumentBuffer(botToken, chatId, rawBuffer, `📦 [${resolutionTag}] 官方无损 PNG 原图文件（无压缩）`, filename);
         }
       };
 
@@ -146,7 +145,7 @@ export default async function handler(req, res) {
         const prefix = userText.startsWith('/img2img') ? '/img2img' : (userText.startsWith('/draw') ? '/draw' : '');
         const { prompt, resolutionTag, enhancedPrompt } = parseResolutionAndPrompt(userText, prefix);
         
-        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在以官方 [${resolutionTag}] 规格和 PNG 无损格式进行图生图创作，请稍候捏~ (≧◡≦)`);
+        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在以 [${resolutionTag}] PNG 规格参考创作捏~ (≧◡≦)`);
 
         try {
           const imageApiRes = await fetch(`${IMAGE_API_BASE}/chat/completions`, {
@@ -157,7 +156,6 @@ export default async function handler(req, res) {
             },
             body: JSON.stringify({
               model: IMAGE_MODEL_NAME,
-              // 按照官方规范，在 generation_config 或请求体中带上分辨率及 PNG 格式约束
               generation_config: {
                 response_mime_type: "image/png",
                 resolution: resolutionTag
@@ -178,6 +176,8 @@ export default async function handler(req, res) {
           if (!imageApiRes.ok) throw new Error(imageApiData.error?.message || `API error: ${imageApiRes.status}`);
 
           const replyContent = imageApiData.choices?.[0]?.message?.content || '';
+          
+          // 【调试机制】如果没抓到图片，把模型返回的原话发出来让你看看
           let finalImageUrl = null;
           let isBase64 = false;
 
@@ -192,7 +192,10 @@ export default async function handler(req, res) {
           else if (genericHttpMatch) { finalImageUrl = genericHttpMatch[0]; }
           else if (replyContent.startsWith('http')) { finalImageUrl = replyContent.trim().split(/\s+/)[0]; }
 
-          if (!finalImageUrl) throw new Error(`模型未返回有效图片，回复内容: ${replyContent.slice(0, 100)}`);
+          if (!finalImageUrl) {
+            await sendTelegramMessage(BOT_TOKEN, chatId, `🔍 调试提示：模型返回了文本而非直接图片链接，内容为:\n${replyContent.slice(0, 300)}`);
+            throw new Error(`模型未返回有效图片链接`);
+          }
 
           await sendImageResult(BOT_TOKEN, chatId, finalImageUrl, prompt, resolutionTag, isBase64);
 
@@ -215,7 +218,7 @@ export default async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
 
-        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在为您调用官方 [${resolutionTag}] 极清规范绘制无损 PNG 大图，马上把网页直链和原文件发给你哦~ ✨`);
+        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在为您调用 [${resolutionTag}] 极清规范绘制 PNG 大图，请稍候哦~ ✨`);
 
         try {
           const imageApiRes = await fetch(`${IMAGE_API_BASE}/chat/completions`, {
@@ -226,7 +229,6 @@ export default async function handler(req, res) {
             },
             body: JSON.stringify({
               model: IMAGE_MODEL_NAME,
-              // 关键：显式带上官方支持的 resolution 和 response_mime_type 传参
               generation_config: {
                 response_mime_type: "image/png",
                 resolution: resolutionTag
@@ -239,6 +241,7 @@ export default async function handler(req, res) {
           if (!imageApiRes.ok) throw new Error(imageApiData.error?.message || `API error: ${imageApiRes.status}`);
 
           const replyContent = imageApiData.choices?.[0]?.message?.content || '';
+          
           let finalImageUrl = null;
           let isBase64 = false;
 
@@ -253,7 +256,10 @@ export default async function handler(req, res) {
           else if (genericHttpMatch) { finalImageUrl = genericHttpMatch[0]; }
           else if (replyContent.startsWith('http')) { finalImageUrl = replyContent.trim().split(/\s+/)[0]; }
 
-          if (!finalImageUrl) throw new Error(`模型未返回有效图片，文字回复: ${replyContent.slice(0, 100)}`);
+          if (!finalImageUrl) {
+            await sendTelegramMessage(BOT_TOKEN, chatId, `🔍 调试提示：模型返回了文本而非直接图片链接，内容为:\n${replyContent.slice(0, 300)}`);
+            throw new Error(`模型未返回有效图片链接`);
+          }
 
           await sendImageResult(BOT_TOKEN, chatId, finalImageUrl, prompt, resolutionTag, isBase64);
 
@@ -343,6 +349,7 @@ async function sendTelegramDocumentBuffer(botToken, chatId, buffer, caption, fil
     Buffer.from(`--${boundary}--\r\n`)
   ];
   await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
+    model: 'POST',
     method: 'POST',
     headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
     body: Buffer.concat(bodyParts)
