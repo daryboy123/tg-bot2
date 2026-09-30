@@ -32,11 +32,15 @@ export default async function handler(req, res) {
     const parts = [{ text: prompt }];
     if (source) parts.push({ inlineData: await downloadInput(BOT_TOKEN, source) });
 
-    const base = (process.env.API_BASE || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
+    const configuredBase = (process.env.IMAGE_API_BASE || process.env.API_BASE || 'https://img-api.apinebula.ai/v1beta').replace(/\/+$/, '');
+    const base = /^https:\/\/(?:img-api\.)?apinebula\.ai(?:\/v1(?:beta)?)?$/.test(configuredBase)
+      ? 'https://img-api.apinebula.ai/v1beta' : configuredBase;
+    const auth = new URL(base).hostname === 'generativelanguage.googleapis.com'
+      ? { 'x-goog-api-key': API_KEY } : { Authorization: `Bearer ${API_KEY}` };
     const model = process.env.IMAGE_MODEL_NAME || 'gemini-3.1-flash-image';
     const response = await fetch(`${base}/models/${encodeURIComponent(model)}:generateContent`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': API_KEY },
+      headers: { 'Content-Type': 'application/json', ...auth },
       body: JSON.stringify({
         contents: [{ role: 'user', parts }],
         generationConfig: {
@@ -53,19 +57,22 @@ export default async function handler(req, res) {
       .find(inline => inline?.data && /^image\//i.test(inline.mimeType || inline.mime_type || ''));
     if (!image) throw new Error('模型未返回图片，请检查模型名称、图片生成权限或更换提示词。');
     const raw = Buffer.from(image.data, 'base64');
-    const dimensions = pngDimensions(raw);
-    if (!dimensions) throw new Error('接口返回的不是 PNG 原图。本次不会把 JPG 改名为 PNG，也不会转换后冒充官方原图；请检查所用模型或中转接口。');
-    const filename = `Artwork_${imageSize}_${dimensions.width}x${dimensions.height}_${Date.now()}.png`;
+    const png = pngDimensions(raw);
+    const dimensions = png || jpegDimensions(raw);
+    if (!dimensions) throw new Error('接口返回的图片不是可识别的 PNG/JPEG，无法作为原图交付。');
+    const format = png ? 'PNG' : 'JPEG';
+    const mimeType = png ? 'image/png' : 'image/jpeg';
+    const filename = `Artwork_${imageSize}_${dimensions.width}x${dimensions.height}_${Date.now()}.${png ? 'png' : 'jpg'}`;
 
     // Upload precisely the model's bytes: no decoding, resizing or transcoding.
     const stored = await put(`artworks/${filename}`, raw, {
-      access: 'public', contentType: 'image/png', addRandomSuffix: true,
+      access: 'public', contentType: mimeType, addRandomSuffix: true,
       token: BLOB_READ_WRITE_TOKEN
     });
     const link = stored.downloadUrl || stored.url;
     await telegram(BOT_TOKEN, 'sendMessage', {
       chat_id: chatId,
-      text: `✅ PNG 原图已生成\n请求档位：${imageSize}\n实际像素：${dimensions.width} × ${dimensions.height}\n大小：${(raw.length / 1024 / 1024).toFixed(2)} MB\n\n浏览器下载原图（模型返回的原始文件，未压缩）：\n${link}\n\n链接托管在本机器人的文件存储中，并非 Google 官方域名。`,
+      text: `✅ ${format} 原始文件已保存\n请求档位：${imageSize}\n实际像素：${dimensions.width} × ${dimensions.height}\n大小：${(raw.length / 1024 / 1024).toFixed(2)} MB\n\n浏览器下载原图（中转接口返回的原始文件，未二次压缩）：\n${link}\n\n${png ? '' : '注意：中转返回的是 JPEG，不是 PNG。这里保留原始文件，不改格式冒充 PNG。\n'}链接托管在本机器人的文件存储中，并非 Google 官方域名。`,
       link_preview_options: { is_disabled: true }
     });
 
@@ -75,13 +82,13 @@ export default async function handler(req, res) {
         Math.max(dimensions.width, dimensions.height) / Math.min(dimensions.width, dimensions.height) <= 20) {
       try {
         await uploadTelegram(BOT_TOKEN, 'sendPhoto', 'photo', chatId, raw, filename,
-          '🖼 预览图（可能被 Telegram 压缩）；请使用下载链接或下方 PNG 文件获取原图。');
+          '🖼 预览图（可能被 Telegram 压缩）；请使用下载链接或下方文件获取原图。', mimeType);
       } catch { /* Preview is optional; original delivery continues. */ }
     }
     if (raw.length < 49 * 1024 * 1024) {
       try {
         await uploadTelegram(BOT_TOKEN, 'sendDocument', 'document', chatId, raw, filename,
-          `📦 PNG 原始文件 · ${dimensions.width} × ${dimensions.height}`);
+          `📦 ${format} 原始文件 · ${dimensions.width} × ${dimensions.height}`, mimeType);
       } catch {
         await telegram(BOT_TOKEN, 'sendMessage', { chat_id: chatId, text: '原图文件发送到 Telegram 失败，请使用上方链接下载，原图已经保存。' });
       }
@@ -115,6 +122,29 @@ function imageAttachment(message) {
   return message?.photo?.at(-1);
 }
 
+function jpegDimensions(bytes) {
+  if (bytes.length < 4 || bytes.readUInt16BE(0) !== 0xffd8) return null;
+  let offset = 2;
+  const frames = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+  while (offset < bytes.length) {
+    if (bytes[offset++] !== 0xff) return null;
+    while (bytes[offset] === 0xff) offset++;
+    const marker = bytes[offset++];
+    if (marker === 0xda || marker === 0xd9) return null;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (offset + 2 > bytes.length) return null;
+    const length = bytes.readUInt16BE(offset);
+    if (length < 2 || offset + length > bytes.length) return null;
+    if (frames.has(marker)) {
+      if (length < 8) return null;
+      const height = bytes.readUInt16BE(offset + 3), width = bytes.readUInt16BE(offset + 5);
+      return width && height ? { width, height } : null;
+    }
+    offset += length;
+  }
+  return null;
+}
+
 async function downloadInput(token, attachment) {
   const file = await telegram(token, 'getFile', { file_id: attachment.file_id });
   const response = await fetch(`https://api.telegram.org/file/bot${token}/${file.file_path}`);
@@ -136,11 +166,11 @@ async function telegram(token, method, payload) {
   return result.result;
 }
 
-async function uploadTelegram(token, method, field, chatId, raw, filename, caption) {
+async function uploadTelegram(token, method, field, chatId, raw, filename, caption, mimeType) {
   const form = new FormData();
   form.append('chat_id', String(chatId));
   form.append('caption', caption);
   if (field === 'document') form.append('disable_content_type_detection', 'true');
-  form.append(field, new Blob([raw], { type: 'image/png' }), filename);
+  form.append(field, new Blob([raw], { type: mimeType }), filename);
   return telegram(token, method, form);
 }
