@@ -8,7 +8,6 @@ export default async function handler(req, res) {
 
   const { BOT_TOKEN, API_KEY, API_BASE, MODEL_NAME } = process.env;
 
-  // 使用官方标准的 Gemini API 基础路径
   const GEMINI_API_BASE = API_BASE || 'https://generativelanguage.googleapis.com/v1beta';
   const IMAGE_MODEL_NAME = 'gemini-3.1-flash-image';
 
@@ -45,7 +44,7 @@ export default async function handler(req, res) {
           const imgRes = await fetch(downloadUrl);
           const arrayBuffer = await imgRes.arrayBuffer();
           const base64Image = Buffer.from(arrayBuffer).toString('base64');
-          imageUrl = base64Image; // 纯 Base64 字符串
+          imageUrl = base64Image;
         }
       }
 
@@ -89,14 +88,14 @@ export default async function handler(req, res) {
         };
       };
 
-      // 核心处理函数：接收 Base64 数据并强制无损 PNG 发送
+      // 核心处理函数：同时发送预览图和无损原图文件
       const sendImageResult = async (botToken, chatId, base64Data, caption, resolutionTag) => {
         const rawBuffer = Buffer.from(base64Data, 'base64');
 
-        // 1. 发送预览图
+        // 1. 发送聊天预览图
         await sendTelegramPhotoBuffer(botToken, chatId, rawBuffer, `✨ [${resolutionTag}] 预览图: ${caption}`, `preview.png`);
 
-        // 2. 发送无损原图文件（绝不压缩）
+        // 2. 发送纯正无损 PNG 原图文件（绝不压缩）
         const filename = `Artwork_${resolutionTag}_${Date.now()}.png`;
         await sendTelegramDocumentBuffer(botToken, chatId, rawBuffer, `📦 [${resolutionTag}] 官方纯正无损 PNG 原图文件`, filename);
       };
@@ -111,7 +110,6 @@ export default async function handler(req, res) {
         await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在调用官方 [${resolutionTag}] 原生接口为您绘制无损 PNG 大图，请稍候哦~ ✨`);
 
         try {
-          // 构造官方标准的 Gemini 传参结构
           const parts = [{ text: enhancedPrompt }];
           if (imageUrl) {
             parts.push({
@@ -122,7 +120,6 @@ export default async function handler(req, res) {
             });
           }
 
-          // 官方标准生成端点: models/{model}:generateContent
           const officialUrl = `${GEMINI_API_BASE}/models/${IMAGE_MODEL_NAME}:generateContent?key=${API_KEY}`;
           
           const imageApiRes = await fetch(officialUrl, {
@@ -142,7 +139,6 @@ export default async function handler(req, res) {
             throw new Error(imageApiData.error?.message || `API error: ${imageApiRes.status}`);
           }
 
-          // 从官方返回的候选结构中提取内嵌的 Base64 图片数据
           const candidate = imageApiData.candidates?.[0];
           const responseParts = candidate?.content?.parts || [];
           
@@ -238,7 +234,7 @@ async function sendTelegramDocumentBuffer(botToken, chatId, buffer, caption, fil
   const boundary = '----TelegramFormBoundary' + Math.random().toString(36).substring(2);
   let bodyParts = [
     Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`),
-    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\.`),
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`),
     Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${filename}"\r\nContent-Type: image/png\r\n\r\n`),
     buffer,
     Buffer.from(`--${boundary}--\r\n`)
