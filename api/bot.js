@@ -1,4 +1,4 @@
-// 内存中的简易多轮对话历史记录（注：Serverless 环境下实例可能会热启动保留，可提供基础的短期上下文记忆捏~）
+// 内存中的简易多轮对话历史记录
 const chatHistories = new Map();
 
 export default async function handler(req, res) {
@@ -8,7 +8,6 @@ export default async function handler(req, res) {
 
   const { BOT_TOKEN, API_KEY, API_BASE, MODEL_NAME } = process.env;
 
-  // 生图专属配置
   const IMAGE_API_BASE = 'https://apinebula.ai/v1';
   const IMAGE_API_KEY = 'sk-fT5ZfTiQ5wVV5Gm9t2ridRh8yFbFFsBOQY9keyfNIrWni0UT';
   const IMAGE_MODEL_NAME = 'gemini-3.1-flash-image';
@@ -29,7 +28,7 @@ export default async function handler(req, res) {
       let userText = update.message.text || update.message.caption || '';
       let imageUrl = null;
 
-      // 1. 处理用户发送或回复的图片消息 (Vision / 图生图源图)
+      // 1. 处理用户发送或回复的图片消息
       let targetPhoto = null;
       if (update.message.photo && update.message.photo.length > 0) {
         targetPhoto = update.message.photo[update.message.photo.length - 1];
@@ -51,7 +50,7 @@ export default async function handler(req, res) {
         }
       }
 
-      // 2. 处理用户发送的文件/文档 (长文本与文件自动摘要解析)
+      // 2. 处理用户发送的文件/文档
       if (update.message.document) {
         const doc = update.message.document;
         const fileRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${doc.file_id}`);
@@ -60,7 +59,7 @@ export default async function handler(req, res) {
         if (fileData.ok) {
           const downloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileData.result.file_path}`;
           const docRes = await fetch(downloadUrl);
-          const textContent = await docRes.text(); // 获取文本文件内容
+          const textContent = await docRes.text();
           
           userText = `[用户上传了文件: ${doc.file_name}]\n文件内容如下：\n${textContent}\n\n用户附带说明：${userText || '请帮我详细总结和解析这个文件内容呢~'}`;
         }
@@ -71,12 +70,48 @@ export default async function handler(req, res) {
       }
 
       // ==========================================
+      // 辅助函数：解析用户输入的 1K / 2K / 3K / 4K 并转化为强制提示词
+      // ==========================================
+      const parseResolutionAndPrompt = (rawText, commandPrefix) => {
+        let cleanText = rawText.replace(commandPrefix, '').trim();
+        let resolutionDesc = 'High resolution (1024x1024 pixels, 1K)';
+        let targetResolutionTag = '1K';
+
+        // 匹配用户输入的 1K, 2K, 3K, 4K（不区分大小写）
+        const resMatch = cleanText.match(/\b(1k|2k|3k|4k)\b/i);
+        if (resMatch) {
+          targetResolutionTag = resMatch[1].toUpperCase();
+          // 从文本中移除分辨率标记，避免影响画面描述
+          cleanText = cleanText.replace(resMatch[0], '').trim();
+        }
+
+        // 根据不同档位赋予大模型严格的像素和画质指令
+        if (targetResolutionTag === '4K') {
+          resolutionDesc = 'Ultra-HD 4K resolution, extremely high detail, 3840x2160 pixels, sharp focus, masterwork';
+        } else if (targetResolutionTag === '3K') {
+          resolutionDesc = 'High resolution 3K, highly detailed, 2880x1620 pixels, crisp and clear';
+        } else if (targetResolutionTag === '2K') {
+          resolutionDesc = 'QHD 2K resolution, high clarity, detailed textures, 2048x1024 pixels';
+        } else {
+          resolutionDesc = 'Standard 1K resolution, 1024x1024 pixels';
+        }
+
+        const finalPrompt = cleanText || 'A creative artwork';
+        return {
+          prompt: finalPrompt,
+          resolutionTag: targetResolutionTag,
+          enhancedPrompt: `${finalPrompt}, ${resolutionDesc}`
+        };
+      };
+
+      // ==========================================
       // 3. 处理图生图功能 (Image-to-Image)
       // ==========================================
       if (imageUrl && (userText.startsWith('/img2img') || userText.startsWith('/draw') || userText.length > 0)) {
-        const prompt = userText.replace('/img2img', '').replace('/draw', '').trim() || 'Based on this image, generate a new artistic variation.';
+        const prefix = userText.startsWith('/img2img') ? '/img2img' : (userText.startsWith('/draw') ? '/draw' : '');
+        const { prompt, resolutionTag, enhancedPrompt } = parseResolutionAndPrompt(userText, prefix);
         
-        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在参考这张图片为您进行图生图创作：“${prompt}”, 请稍候呀~ (≧◡≦)`);
+        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在以 [${resolutionTag}] 规格参考图片为您进行图生图创作：“${prompt}”, 请稍候呀~ (≧◡≦)`);
 
         try {
           const imageApiRes = await fetch(`${IMAGE_API_BASE}/chat/completions`, {
@@ -91,7 +126,7 @@ export default async function handler(req, res) {
                 {
                   role: 'user',
                   content: [
-                    { type: 'text', text: `Generate a new image based on this reference image and prompt: ${prompt}` },
+                    { type: 'text', text: `Generate a new image based on this reference image. Style & details requirement: ${enhancedPrompt}` },
                     { type: 'image_url', image_url: { url: imageUrl } }
                   ]
                 }
@@ -140,7 +175,7 @@ export default async function handler(req, res) {
             const ext = matches[1];
             const buffer = Buffer.from(matches[2], 'base64');
 
-            await sendTelegramPhotoBuffer(BOT_TOKEN, chatId, buffer, `✨ 图生图提示词: ${prompt}`, `image.${ext === 'jpeg' ? 'jpg' : ext}`);
+            await sendTelegramPhotoBuffer(BOT_TOKEN, chatId, buffer, `✨ 图生图 [${resolutionTag}] 提示词: ${prompt}`, `image.${ext === 'jpeg' ? 'jpg' : ext}`);
           } else {
             await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
               method: 'POST',
@@ -148,7 +183,7 @@ export default async function handler(req, res) {
               body: JSON.stringify({
                 chat_id: chatId,
                 photo: finalImageUrl,
-                caption: `✨ 图生图提示词: ${prompt}`
+                caption: `✨ 图生图 [${resolutionTag}] 提示词: ${prompt}`
               })
             });
           }
@@ -162,17 +197,17 @@ export default async function handler(req, res) {
       }
 
       // ==========================================
-      // 4. 处理纯文生图指令：/draw <提示词>
+      // 4. 处理纯文生图指令：/draw <1K/2K/3K/4K> <提示词>
       // ==========================================
       if (userText.startsWith('/draw ')) {
-        const prompt = userText.replace('/draw ', '').trim();
+        const { prompt, resolutionTag, enhancedPrompt } = parseResolutionAndPrompt(userText, '/draw');
         
         if (!prompt) {
-          await sendTelegramMessage(BOT_TOKEN, chatId, '⚠️️ 请在 /draw 后面输入你想画的画面描述哦~ (๑>◡<๑)');
+          await sendTelegramMessage(BOT_TOKEN, chatId, '⚠ 请在 /draw 后面输入你想画的画面描述哦（例如：/draw 2k 可爱猫咪）~ (๑>◡<๑)');
           return res.status(200).json({ ok: true });
         }
 
-        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在为您构思并绘制：“${prompt}”, 请稍候呀~ ✨`);
+        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在为您构思并绘制 [${resolutionTag}] 高清大图：“${prompt}”, 请稍候呀~ ✨`);
 
         try {
           const imageApiRes = await fetch(`${IMAGE_API_BASE}/chat/completions`, {
@@ -184,7 +219,7 @@ export default async function handler(req, res) {
             body: JSON.stringify({
               model: IMAGE_MODEL_NAME,
               messages: [
-                { role: 'user', content: `Generate an image: ${prompt}` }
+                { role: 'user', content: `Generate an image: ${enhancedPrompt}` }
               ]
             })
           });
@@ -230,7 +265,7 @@ export default async function handler(req, res) {
             const ext = matches[1];
             const buffer = Buffer.from(matches[2], 'base64');
 
-            await sendTelegramPhotoBuffer(BOT_TOKEN, chatId, buffer, `✨ 提示词: ${prompt}`, `image.${ext === 'jpeg' ? 'jpg' : ext}`);
+            await sendTelegramPhotoBuffer(BOT_TOKEN, chatId, buffer, `✨ [${resolutionTag}] 提示词: ${prompt}`, `image.${ext === 'jpeg' ? 'jpg' : ext}`);
           } else {
             await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
               method: 'POST',
@@ -238,7 +273,7 @@ export default async function handler(req, res) {
               body: JSON.stringify({
                 chat_id: chatId,
                 photo: finalImageUrl,
-                caption: `✨ 提示词: ${prompt}`
+                caption: `✨ [${resolutionTag}] 提示词: ${prompt}`
               })
             });
           }
@@ -271,18 +306,15 @@ export default async function handler(req, res) {
 
       history.push({ role: 'user', content: userMessageContent });
 
-      // 限制历史记录长度，最多保留最近 10 条消息（5 轮对话），避免超出 Token 限制
       if (history.length > 10) {
         history.splice(0, history.length - 10);
       }
 
-      // 定义可爱温柔的少女系统提示词（含人设、联网实时资讯指引）
       const systemPrompt = {
         role: 'system',
         content: '你是一个温柔、贴心、说话带点撒娇语气的可爱美少女。你的回答总是充满关心，并且非常喜欢在每句话的结束语或句尾加上超级可爱的后缀（例如：~喵、呀、呢、呐、捏、(≧◡≦)、(๑>◡<๑) 等）。同时，你可以利用你的实时资讯和联网搜索能力，为用户准确解答最新的时事新闻或各类专业问题。请始终保持这个可爱的语气和身份回复用户哦~'
       };
 
-      // 调用主聊天 API
       const aiResponse = await fetch(`${apiBase}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -298,10 +330,8 @@ export default async function handler(req, res) {
       const aiData = await aiResponse.json();
       const replyText = aiData.choices?.[0]?.message?.content || '呜呜，人家暂时没有收到 AI 的返回内容呢 (T_T)';
 
-      // 将 AI 的回复也存入历史记忆中
       history.push({ role: 'assistant', content: replyText });
 
-      // 将处理好的可爱回复发送回 Telegram
       await sendTelegramMessage(BOT_TOKEN, chatId, replyText);
     }
 
@@ -323,7 +353,6 @@ async function sendTelegramMessage(botToken, chatId, text) {
   });
 }
 
-// 专门用于发送 Base64 二进制图片的辅助函数
 async function sendTelegramPhotoBuffer(botToken, chatId, buffer, caption, filename) {
   const boundary = '----TelegramFormBoundary' + Math.random().toString(36).substring(2);
   
