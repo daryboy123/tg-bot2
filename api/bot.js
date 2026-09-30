@@ -86,20 +86,19 @@ export default async function handler(req, res) {
         return {
           prompt: finalPrompt,
           resolutionTag: targetResolutionTag,
-          enhancedPrompt: `${finalPrompt}, output strictly as lossless PNG format, native ultra-high definition resolution (${targetResolutionTag})`
+          enhancedPrompt: `${finalPrompt}, high quality, lossless PNG format, ultra-high definition resolution (${targetResolutionTag})`
         };
       };
 
-      // 核心处理函数
+      // 核心处理函数：直接将 Base64 或网络图片转换为无损 PNG 交付文件
       const sendImageResult = async (botToken, chatId, bufferOrUrl, caption, resolutionTag, isBase64) => {
         let rawBuffer = null;
         let directUrl = null;
 
         if (isBase64) {
-          const matches = bufferOrUrl.match(/^data:image\/([a-zA-Z0-9+.-]+);base64,(.+)$/);
-          if (matches) {
-            rawBuffer = Buffer.from(matches[2], 'base64');
-          }
+          // 清洗并提取 Base64 的纯净二进制数据
+          const base64Clean = bufferOrUrl.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, '');
+          rawBuffer = Buffer.from(base64Clean, 'base64');
         } else {
           directUrl = bufferOrUrl;
           try {
@@ -111,30 +110,20 @@ export default async function handler(req, res) {
           }
         }
 
-        // 1. 发送预览图
-        if (isBase64 && rawBuffer) {
+        // 1. 发送 Telegram 聊天预览图
+        if (rawBuffer) {
           await sendTelegramPhotoBuffer(botToken, chatId, rawBuffer, `✨ [${resolutionTag}] 预览图: ${caption}`, `preview.png`);
-        } else {
-          await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: chatId,
-              photo: bufferOrUrl,
-              caption: `✨ [${resolutionTag}] 预览图: ${caption}`
-            })
-          });
         }
 
-        // 2. 发送直链（如果有）
+        // 2. 如果有网络直链，顺便发一条
         if (directUrl) {
-          await sendTelegramMessage(botToken, chatId, `🌐 [${resolutionTag}] 原始图片网络直链:\n${directUrl}`);
+          await sendTelegramMessage(botToken, chatId, `🌐 [${resolutionTag}] 图片网络直链:\n${directUrl}`);
         }
 
-        // 3. 强制作为无损 PNG 文件（Document）发送，这是最核心的无压缩原图
+        // 3. 绝对核心：以 Telegram Document 形式发送无损 PNG 原图文件（绝不二次压缩）
         if (rawBuffer) {
           const filename = `Artwork_${resolutionTag}_${Date.now()}.png`;
-          await sendTelegramDocumentBuffer(botToken, chatId, rawBuffer, `📦 [${resolutionTag}] 官方无损 PNG 原图文件（无压缩）`, filename);
+          await sendTelegramDocumentBuffer(botToken, chatId, rawBuffer, `📦 [${resolutionTag}] 纯正无损 PNG 原始大图文件`, filename);
         }
       };
 
@@ -156,10 +145,6 @@ export default async function handler(req, res) {
             },
             body: JSON.stringify({
               model: IMAGE_MODEL_NAME,
-              generation_config: {
-                response_mime_type: "image/png",
-                resolution: resolutionTag
-              },
               messages: [
                 {
                   role: 'user',
@@ -177,11 +162,11 @@ export default async function handler(req, res) {
 
           const replyContent = imageApiData.choices?.[0]?.message?.content || '';
           
-          // 【调试机制】如果没抓到图片，把模型返回的原话发出来让你看看
           let finalImageUrl = null;
           let isBase64 = false;
 
-          const base64Match = replyContent.match(/(data:image\/[a-zA-Z0-9+.-]+;base64,[^\s)]+)/i);
+          // 更全面的匹配：支持匹配带有 data:image 前缀的 Base64，或者 Markdown 链接，或者普通 URL
+          const base64Match = replyContent.match(/(data:image\/[a-zA-Z0-9+.-]+;base64,[A-Za-z0-9+/=]+)/i);
           const markdownImgMatch = replyContent.match(/\((https?:\/\/[^\s)]+)\)/);
           const rawUrlMatch = replyContent.match(/(https?:\/\/[^\s]+\.(png|jpg|jpeg|webp|gif|bmp|tiff))/i);
           const genericHttpMatch = replyContent.match(/(https?:\/\/[^\s<>"]+)/i);
@@ -191,10 +176,15 @@ export default async function handler(req, res) {
           else if (rawUrlMatch) { finalImageUrl = rawUrlMatch[0]; }
           else if (genericHttpMatch) { finalImageUrl = genericHttpMatch[0]; }
           else if (replyContent.startsWith('http')) { finalImageUrl = replyContent.trim().split(/\s+/)[0]; }
+          else if (replyContent.length > 500) {
+            // 如果文本特别长，极有可能是模型直接裸输了一大串 Base64 字符串而没有加 data 头部
+            finalImageUrl = `data:image/png;base64,${replyContent.trim()}`;
+            isBase64 = true;
+          }
 
           if (!finalImageUrl) {
-            await sendTelegramMessage(BOT_TOKEN, chatId, `🔍 调试提示：模型返回了文本而非直接图片链接，内容为:\n${replyContent.slice(0, 300)}`);
-            throw new Error(`模型未返回有效图片链接`);
+            await sendTelegramMessage(BOT_TOKEN, chatId, `🔍 调试提示：未检测到图片，模型返回内容为:\n${replyContent.slice(0, 300)}`);
+            throw new Error(`模型未返回有效图片`);
           }
 
           await sendImageResult(BOT_TOKEN, chatId, finalImageUrl, prompt, resolutionTag, isBase64);
@@ -229,10 +219,6 @@ export default async function handler(req, res) {
             },
             body: JSON.stringify({
               model: IMAGE_MODEL_NAME,
-              generation_config: {
-                response_mime_type: "image/png",
-                resolution: resolutionTag
-              },
               messages: [{ role: 'user', content: `Generate an image: ${enhancedPrompt}` }]
             })
           });
@@ -245,7 +231,7 @@ export default async function handler(req, res) {
           let finalImageUrl = null;
           let isBase64 = false;
 
-          const base64Match = replyContent.match(/(data:image\/[a-zA-Z0-9+.-]+;base64,[^\s)]+)/i);
+          const base64Match = replyContent.match(/(data:image\/[a-zA-Z0-9+.-]+;base64,[A-Za-z0-9+/=]+)/i);
           const markdownImgMatch = replyContent.match(/\((https?:\/\/[^\s)]+)\)/);
           const rawUrlMatch = replyContent.match(/(https?:\/\/[^\s]+\.(png|jpg|jpeg|webp|gif|bmp|tiff))/i);
           const genericHttpMatch = replyContent.match(/(https?:\/\/[^\s<>"]+)/i);
@@ -255,10 +241,14 @@ export default async function handler(req, res) {
           else if (rawUrlMatch) { finalImageUrl = rawUrlMatch[0]; }
           else if (genericHttpMatch) { finalImageUrl = genericHttpMatch[0]; }
           else if (replyContent.startsWith('http')) { finalImageUrl = replyContent.trim().split(/\s+/)[0]; }
+          else if (replyContent.length > 500) {
+            finalImageUrl = `data:image/png;base64,${replyContent.trim()}`;
+            isBase64 = true;
+          }
 
           if (!finalImageUrl) {
-            await sendTelegramMessage(BOT_TOKEN, chatId, `🔍 调试提示：模型返回了文本而非直接图片链接，内容为:\n${replyContent.slice(0, 300)}`);
-            throw new Error(`模型未返回有效图片链接`);
+            await sendTelegramMessage(BOT_TOKEN, chatId, `🔍 调试提示：未检测到图片，模型返回内容为:\n${replyContent.slice(0, 300)}`);
+            throw new Error(`模型未返回有效图片`);
           }
 
           await sendImageResult(BOT_TOKEN, chatId, finalImageUrl, prompt, resolutionTag, isBase64);
@@ -349,7 +339,6 @@ async function sendTelegramDocumentBuffer(botToken, chatId, buffer, caption, fil
     Buffer.from(`--${boundary}--\r\n`)
   ];
   await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
-    model: 'POST',
     method: 'POST',
     headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
     body: Buffer.concat(bodyParts)
