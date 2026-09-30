@@ -101,26 +101,32 @@ export default async function handler(req, res) {
         };
       };
 
-      // 统一处理图片分发：既发预览图（Photo），又发无损原图文件（Document）
+      // 核心完美分发函数：既发 TG 预览图，又发送全分辨率下载直链与无损文件
       const sendImageResult = async (botToken, chatId, bufferOrUrl, caption, resolutionTag, isBase64) => {
-        let buffer;
+        let rawBuffer = null;
+        let directUrl = null;
         let ext = 'png';
 
         if (isBase64) {
           const matches = bufferOrUrl.match(/^data:image\/([a-zA-Z0-9+.-]+);base64,(.+)$/);
-          if (!matches) throw new Error('解析 Base64 图片数据失败');
-          ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
-          buffer = Buffer.from(matches[2], 'base64');
+          if (matches) {
+            ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
+            rawBuffer = Buffer.from(matches[2], 'base64');
+          }
         } else {
-          // 如果是网络链接，先下载到本地转成 Buffer
-          const imgRes = await fetch(bufferOrUrl);
-          const arrayBuffer = await imgRes.arrayBuffer();
-          buffer = Buffer.from(arrayBuffer);
+          directUrl = bufferOrUrl;
+          try {
+            const imgRes = await fetch(directUrl);
+            const arrayBuffer = await imgRes.arrayBuffer();
+            rawBuffer = Buffer.from(arrayBuffer);
+          } catch (e) {
+            console.error('Failed to fetch direct image URL buffer:', e);
+          }
         }
 
-        // 1. 发送压缩的预览图供直接查看
-        if (isBase64) {
-          await sendTelegramPhotoBuffer(botToken, chatId, buffer, `✨ [${resolutionTag}] 预览图: ${caption}`, `preview_${Date.now()}.${ext}`);
+        // 1. 发送 Telegram 压缩预览图（方便直接看）
+        if (isBase64 && rawBuffer) {
+          await sendTelegramPhotoBuffer(botToken, chatId, rawBuffer, `✨ [${resolutionTag}] 预览图: ${caption}`, `preview.${ext}`);
         } else {
           await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
             method: 'POST',
@@ -133,9 +139,16 @@ export default async function handler(req, res) {
           });
         }
 
-        // 2. 额外以【文件/文档】形式发送一份全分辨率原图（Telegram 传输不压缩，保真 100%）
-        const filename = `Artwork_${resolutionTag}_${Date.now()}.${ext}`;
-        await sendTelegramDocumentBuffer(botToken, chatId, buffer, `📦 [${resolutionTag}] 全分辨率无损原图下载`, filename);
+        // 2. 如果有网络直链，直接发一条带直链的文字消息，供你点击或复制
+        if (directUrl) {
+          await sendTelegramMessage(botToken, chatId, `🔗 [${resolutionTag}] 全分辨率原图下载直链:\n${directUrl}`);
+        }
+
+        // 3. 如果成功获取到了二进制 Buffer，顺便以无损文件（Document）形式发一份，双重保障！
+        if (rawBuffer) {
+          const filename = `Artwork_${resolutionTag}_${Date.now()}.${ext}`;
+          await sendTelegramDocumentBuffer(botToken, chatId, rawBuffer, `📦 [${resolutionTag}] 全分辨率无损原图文件`, filename);
+        }
       };
 
       // ==========================================
@@ -145,7 +158,7 @@ export default async function handler(req, res) {
         const prefix = userText.startsWith('/img2img') ? '/img2img' : (userText.startsWith('/draw') ? '/draw' : '');
         const { prompt, resolutionTag, enhancedPrompt } = parseResolutionAndPrompt(userText, prefix);
         
-        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在以 [${resolutionTag}] 规格参考图片创作，稍后会同时发送【预览图】与【全分辨率无损原图文件】捏~ (≧◡≦)`);
+        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在以 [${resolutionTag}] 规格参考图片创作，稍后会把预览图和全分辨率下载链接发给你捏~ (≧◡≦)`);
 
         try {
           const imageApiRes = await fetch(`${IMAGE_API_BASE}/chat/completions`, {
@@ -205,11 +218,11 @@ export default async function handler(req, res) {
         const { prompt, resolutionTag, enhancedPrompt } = parseResolutionAndPrompt(userText, '/draw');
         
         if (!prompt) {
-          await sendTelegramMessage(BOT_TOKEN, chatId, '⚠ 请在 /draw 后面输入你想画的画面描述哦（例如：/draw 2k 可爱美少女）~ (๑>◡<๑)');
+          await sendTelegramMessage(BOT_TOKEN, chatId, '⚠ 请在 /draw 后面输入你想画的画面描述哦（例如：/draw 4k 一只可爱的猫咪）~ (๑>◡<๑)');
           return res.status(200).json({ ok: true });
         }
 
-        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在为您绘制 [${resolutionTag}] 高清大图，完成后会打包发送无损原图文件给你哦~ ✨`);
+        await sendTelegramMessage(BOT_TOKEN, chatId, `🎨 人家正在为您绘制 [${resolutionTag}] 高清大图，马上把预览和全分辨率下载链接发送给你哦~ ✨`);
 
         try {
           const imageApiRes = await fetch(`${IMAGE_API_BASE}/chat/completions`, {
@@ -322,7 +335,6 @@ async function sendTelegramPhotoBuffer(botToken, chatId, buffer, caption, filena
   });
 }
 
-// 新增：以文件（Document）形式发送无损原图，绕过 Telegram 图片压缩限制
 async function sendTelegramDocumentBuffer(botToken, chatId, buffer, caption, filename) {
   const boundary = '----TelegramFormBoundary' + Math.random().toString(36).substring(2);
   let bodyParts = [
